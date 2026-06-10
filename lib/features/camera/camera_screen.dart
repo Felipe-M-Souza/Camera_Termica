@@ -1,0 +1,813 @@
+import 'dart:async';
+
+import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:fluttertoast/fluttertoast.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:vazamento_detector/features/detection/tflite_detection_service.dart';
+import 'package:vazamento_detector/features/inspection/inspection_result.dart';
+import 'package:vazamento_detector/features/inspection/inspection_result_screen.dart';
+import 'package:vazamento_detector/features/processing/image_processor.dart';
+
+enum _FilterAction {
+  simulatedThermal,
+  edgeHighlight,
+  contrastBoost,
+  lowLightView,
+  simulatedUv,
+  suspiciousDarkAreaHighlight,
+}
+
+class CameraScreen extends StatefulWidget {
+  const CameraScreen({
+    required this.onThemeToggle,
+    super.key,
+  });
+
+  final VoidCallback onThemeToggle;
+
+  @override
+  State<CameraScreen> createState() => _CameraScreenState();
+}
+
+class _CameraScreenState extends State<CameraScreen>
+    with WidgetsBindingObserver {
+  final TfliteDetectionService _detectionService = TfliteDetectionService();
+  CameraController? _cameraController;
+  List<CameraDescription> _cameras = const [];
+  CameraDescription? _selectedCamera;
+  Uint8List? _processedImage;
+  Uint8List? _latestOriginalJpegBytes;
+  ImageAnalysisResult? _latestVisualAnalysis;
+  TfliteDetectionResult? _tfliteResult;
+  FilterOptions _filters = const FilterOptions();
+  ResolutionPreset _selectedResolution = ResolutionPreset.medium;
+  DateTime _lastProcessTime = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastInferenceTime = DateTime.fromMillisecondsSinceEpoch(0);
+  String _aiStatus = 'Carregando IA...';
+  String? _aiErrorDetail;
+  String? _errorMessage;
+  String? _cameraErrorDetail;
+  var _isInitializing = true;
+  var _isProcessing = false;
+  var _isRunningInference = false;
+  var _isCapturing = false;
+  var _alreadyShownToast = false;
+  var _cameraGeneration = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_loadTfliteModel());
+    unawaited(_setupCamera());
+  }
+
+  Future<void> _loadTfliteModel() async {
+    try {
+      await _detectionService.load();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _aiStatus = 'IA pronta (${_detectionService.modelSummary})';
+      });
+    } catch (error, stackTrace) {
+      debugPrint('Erro ao carregar modelo TFLite: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _aiStatus = 'IA indisponivel';
+        _aiErrorDetail = _formatAiError(error, stackTrace);
+      });
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      unawaited(_disposeController());
+      return;
+    }
+
+    if (state == AppLifecycleState.resumed && _selectedCamera != null) {
+      unawaited(_initializeController(_selectedCamera!));
+    }
+  }
+
+  Future<void> _setupCamera() async {
+    if (mounted) {
+      setState(() {
+        _isInitializing = true;
+        _errorMessage = null;
+        _cameraErrorDetail = null;
+      });
+    }
+
+    try {
+      final permission = await Permission.camera.request();
+      if (!permission.isGranted) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _isInitializing = false;
+          _errorMessage = 'Permissao de camera negada.';
+          _cameraErrorDetail = 'Status da permissao: $permission';
+        });
+        return;
+      }
+
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _isInitializing = false;
+          _errorMessage = 'Nenhuma camera foi encontrada neste dispositivo.';
+          _cameraErrorDetail = 'availableCameras retornou lista vazia.';
+        });
+        return;
+      }
+
+      final preferredCamera = _selectedCamera ?? _findBackCamera(cameras);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _cameras = cameras;
+        _selectedCamera = preferredCamera;
+      });
+
+      await _initializeController(preferredCamera);
+    } catch (error, stackTrace) {
+      debugPrint('Erro ao preparar camera: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isInitializing = false;
+        _errorMessage = 'Nao foi possivel iniciar a camera.';
+        _cameraErrorDetail = _formatCameraError(
+          stage: 'Preparacao da camera',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      });
+    }
+  }
+
+  CameraDescription _findBackCamera(List<CameraDescription> cameras) {
+    return cameras.firstWhere(
+      (camera) => camera.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras.first,
+    );
+  }
+
+  Future<void> _initializeController(CameraDescription camera) async {
+    final generation = ++_cameraGeneration;
+    setState(() {
+      _isInitializing = true;
+      _processedImage = null;
+      _errorMessage = null;
+      _cameraErrorDetail = null;
+    });
+
+    await _disposeController();
+
+    Object? lastError;
+    StackTrace? lastStackTrace;
+
+    for (final resolution in _resolutionFallbacks(_selectedResolution)) {
+      final controller = CameraController(
+        camera,
+        resolution,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+
+      _cameraController = controller;
+
+      try {
+        await controller.initialize();
+        if (!mounted || generation != _cameraGeneration) {
+          await controller.dispose();
+          return;
+        }
+
+        await controller.startImageStream(_onCameraImage);
+        if (!mounted || generation != _cameraGeneration) {
+          await controller.dispose();
+          return;
+        }
+
+        setState(() {
+          _isInitializing = false;
+          _selectedCamera = camera;
+          _selectedResolution = resolution;
+          _cameraErrorDetail = null;
+        });
+        return;
+      } catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        debugPrint('Erro ao inicializar camera em ${resolution.name}: $error');
+        debugPrintStack(stackTrace: stackTrace);
+        if (_cameraController == controller) {
+          _cameraController = null;
+        }
+        try {
+          await controller.dispose();
+        } catch (disposeError) {
+          debugPrint('Erro ao descartar controller com falha: $disposeError');
+        }
+        if (!mounted || generation != _cameraGeneration) {
+          return;
+        }
+      }
+    }
+
+    if (!mounted || generation != _cameraGeneration) {
+      return;
+    }
+
+    setState(() {
+      _isInitializing = false;
+      _errorMessage = 'Falha ao abrir a camera selecionada.';
+      _cameraErrorDetail = _formatCameraError(
+        stage: 'Abertura da camera',
+        error: lastError ?? 'Erro desconhecido',
+        stackTrace: lastStackTrace,
+      );
+    });
+  }
+
+  List<ResolutionPreset> _resolutionFallbacks(ResolutionPreset preferred) {
+    const fallbackOrder = [
+      ResolutionPreset.medium,
+      ResolutionPreset.low,
+      ResolutionPreset.high,
+      ResolutionPreset.veryHigh,
+      ResolutionPreset.ultraHigh,
+      ResolutionPreset.max,
+    ];
+
+    return [
+      preferred,
+      ...fallbackOrder.where((resolution) => resolution != preferred),
+    ];
+  }
+
+  void _onCameraImage(CameraImage image) {
+    final now = DateTime.now();
+    if (_isProcessing ||
+        now.difference(_lastProcessTime).inMilliseconds < 300) {
+      return;
+    }
+
+    _lastProcessTime = now;
+    _isProcessing = true;
+
+    final request = ProcessImageRequest(
+      frame: CameraFrame.fromCameraImage(image),
+      filters: _filters,
+    );
+    unawaited(_processCameraImage(request));
+  }
+
+  Future<void> _processCameraImage(ProcessImageRequest request) async {
+    try {
+      final result = await compute(processImageFrame, request);
+      if (!mounted) {
+        return;
+      }
+
+      _showAnalysisToast(result.analysis);
+      setState(() {
+        _processedImage = result.jpegBytes;
+        _latestOriginalJpegBytes = result.originalJpegBytes;
+        _latestVisualAnalysis = result.analysis;
+      });
+      unawaited(_maybeRunTflite(result.originalJpegBytes));
+    } catch (error, stackTrace) {
+      debugPrint('Erro no processamento de imagem: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    } finally {
+      _isProcessing = false;
+    }
+  }
+
+  Future<void> _maybeRunTflite(Uint8List originalJpegBytes) async {
+    final now = DateTime.now();
+    if (!_detectionService.isLoaded ||
+        _isRunningInference ||
+        now.difference(_lastInferenceTime).inMilliseconds < 1000) {
+      return;
+    }
+
+    _lastInferenceTime = now;
+    setState(() {
+      _isRunningInference = true;
+    });
+    try {
+      final result = _detectionService.run(originalJpegBytes);
+      if (!mounted || result == null) {
+        return;
+      }
+      setState(() {
+        _tfliteResult = result;
+        _aiStatus = result.compactLabel;
+        _aiErrorDetail = null;
+      });
+    } catch (error, stackTrace) {
+      debugPrint('Erro na inferencia TFLite: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _aiStatus = 'Erro na IA';
+        _aiErrorDetail = _formatAiError(error, stackTrace);
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isRunningInference = false;
+        });
+      } else {
+        _isRunningInference = false;
+      }
+    }
+  }
+
+  Future<void> _captureCurrentFrame() async {
+    final imageBytes = _latestOriginalJpegBytes;
+    final visualAnalysis = _latestVisualAnalysis;
+    if (imageBytes == null || visualAnalysis == null) {
+      Fluttertoast.showToast(
+        msg: 'Aguarde o primeiro frame da camera.',
+        toastLength: Toast.LENGTH_SHORT,
+        gravity: ToastGravity.TOP,
+      );
+      return;
+    }
+
+    setState(() {
+      _isCapturing = true;
+    });
+
+    var aiStatus = _aiStatus;
+    var aiErrorDetail = _aiErrorDetail;
+    var aiResult = _tfliteResult;
+
+    if (_detectionService.isLoaded && !_isRunningInference) {
+      try {
+        final result = _detectionService.run(imageBytes);
+        if (result != null) {
+          aiResult = result;
+          aiStatus = result.compactLabel;
+          aiErrorDetail = null;
+        }
+      } catch (error, stackTrace) {
+        debugPrint('Erro na inferencia capturada: $error');
+        debugPrintStack(stackTrace: stackTrace);
+        aiStatus = 'Erro na IA';
+        aiErrorDetail = _formatAiError(error, stackTrace);
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _isCapturing = false;
+      _tfliteResult = aiResult;
+      _aiStatus = aiStatus;
+      _aiErrorDetail = aiErrorDetail;
+    });
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => InspectionResultScreen(
+          result: InspectionResult(
+            imageBytes: imageBytes,
+            visualAnalysis: visualAnalysis,
+            aiResult: aiResult,
+            aiStatus: aiStatus,
+            aiErrorDetail: aiErrorDetail,
+            createdAt: DateTime.now(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showAiDetails() {
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Detalhes da IA'),
+          content: SelectableText(
+            _aiErrorDetail ??
+                _detectionService.modelSummary ??
+                'Modelo ainda nao carregado.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Fechar'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _formatAiError(Object error, StackTrace stackTrace) {
+    final stackLines = stackTrace.toString().split('\n');
+    final stackLine = stackLines.isEmpty ? null : stackLines.first;
+    if (stackLine == null || stackLine.isEmpty) {
+      return error.toString();
+    }
+    return '$error\n$stackLine';
+  }
+
+  String _formatCameraError({
+    required String stage,
+    required Object error,
+    StackTrace? stackTrace,
+  }) {
+    final buffer = StringBuffer()
+      ..writeln(stage)
+      ..writeln(error);
+
+    if (error is CameraException) {
+      buffer
+        ..writeln('code: ${error.code}')
+        ..writeln('description: ${error.description}');
+    }
+
+    final stackLines = stackTrace?.toString().split('\n') ?? const <String>[];
+    if (stackLines.isNotEmpty && stackLines.first.isNotEmpty) {
+      buffer.writeln(stackLines.first);
+    }
+
+    return buffer.toString().trim();
+  }
+
+  void _showAnalysisToast(ImageAnalysisResult analysis) {
+    final message = analysis.message;
+    if (_alreadyShownToast || message == null) {
+      return;
+    }
+
+    _alreadyShownToast = true;
+    Fluttertoast.showToast(
+      msg: message,
+      toastLength: Toast.LENGTH_SHORT,
+      gravity: ToastGravity.TOP,
+      backgroundColor: Colors.black87,
+      textColor: Colors.white,
+    );
+
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 5), () {
+        _alreadyShownToast = false;
+      }),
+    );
+  }
+
+  Future<void> _changeResolution(ResolutionPreset resolution) async {
+    if (resolution == _selectedResolution) {
+      return;
+    }
+
+    setState(() {
+      _selectedResolution = resolution;
+    });
+
+    final camera = _selectedCamera;
+    if (camera != null) {
+      await _initializeController(camera);
+    }
+  }
+
+  Future<void> _cycleCamera() async {
+    if (_cameras.length < 2) {
+      return;
+    }
+
+    final currentIndex = _cameras.indexOf(_selectedCamera ?? _cameras.first);
+    final nextCamera = _cameras[(currentIndex + 1) % _cameras.length];
+    await _initializeController(nextCamera);
+  }
+
+  void _toggleFilter(_FilterAction action) {
+    setState(() {
+      switch (action) {
+        case _FilterAction.simulatedThermal:
+          _filters = _filters.copyWith(
+            simulatedThermal: !_filters.simulatedThermal,
+          );
+          break;
+        case _FilterAction.edgeHighlight:
+          _filters = _filters.copyWith(
+            edgeHighlight: !_filters.edgeHighlight,
+          );
+          break;
+        case _FilterAction.contrastBoost:
+          _filters = _filters.copyWith(
+            contrastBoost: !_filters.contrastBoost,
+          );
+          break;
+        case _FilterAction.lowLightView:
+          _filters = _filters.copyWith(
+            lowLightView: !_filters.lowLightView,
+          );
+          break;
+        case _FilterAction.simulatedUv:
+          _filters = _filters.copyWith(
+            simulatedUv: !_filters.simulatedUv,
+          );
+          break;
+        case _FilterAction.suspiciousDarkAreaHighlight:
+          _filters = _filters.copyWith(
+            suspiciousDarkAreaHighlight: !_filters.suspiciousDarkAreaHighlight,
+          );
+          break;
+      }
+    });
+  }
+
+  Future<void> _disposeController() async {
+    final controller = _cameraController;
+    _cameraController = null;
+    if (controller == null) {
+      return;
+    }
+
+    try {
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
+    } catch (error) {
+      debugPrint('Erro ao parar stream da camera: $error');
+    }
+
+    await controller.dispose();
+  }
+
+  @override
+  void dispose() {
+    _cameraGeneration++;
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_disposeController());
+    _detectionService.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = _cameraController;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Vistoria Visual'),
+        actions: [
+          IconButton(
+            tooltip: 'Alternar tema',
+            icon: const Icon(Icons.brightness_6),
+            onPressed: widget.onThemeToggle,
+          ),
+          IconButton(
+            tooltip: 'Detalhes da IA',
+            icon: Icon(
+              _aiErrorDetail == null
+                  ? Icons.psychology_outlined
+                  : Icons.error_outline,
+            ),
+            onPressed: _showAiDetails,
+          ),
+          if (_cameras.length > 1)
+            IconButton(
+              tooltip: 'Alternar camera',
+              icon: const Icon(Icons.cameraswitch),
+              onPressed:
+                  _isInitializing ? null : () => unawaited(_cycleCamera()),
+            ),
+          PopupMenuButton<ResolutionPreset>(
+            tooltip: 'Resolucao',
+            icon: const Icon(Icons.high_quality),
+            enabled: !_isInitializing,
+            onSelected: (resolution) =>
+                unawaited(_changeResolution(resolution)),
+            itemBuilder: (context) => ResolutionPreset.values
+                .map(
+                  (resolution) => CheckedPopupMenuItem<ResolutionPreset>(
+                    value: resolution,
+                    checked: resolution == _selectedResolution,
+                    child: Text(resolution.name),
+                  ),
+                )
+                .toList(growable: false),
+          ),
+          PopupMenuButton<_FilterAction>(
+            tooltip: 'Filtros',
+            icon: const Icon(Icons.tune),
+            onSelected: _toggleFilter,
+            itemBuilder: (context) => [
+              _filterItem(
+                action: _FilterAction.simulatedThermal,
+                label: 'Mapa termico simulado',
+                enabled: _filters.simulatedThermal,
+              ),
+              _filterItem(
+                action: _FilterAction.edgeHighlight,
+                label: 'Realce de bordas',
+                enabled: _filters.edgeHighlight,
+              ),
+              _filterItem(
+                action: _FilterAction.contrastBoost,
+                label: 'Contraste',
+                enabled: _filters.contrastBoost,
+              ),
+              _filterItem(
+                action: _FilterAction.lowLightView,
+                label: 'Baixa luz simulada',
+                enabled: _filters.lowLightView,
+              ),
+              _filterItem(
+                action: _FilterAction.simulatedUv,
+                label: 'UV simulado',
+                enabled: _filters.simulatedUv,
+              ),
+              _filterItem(
+                action: _FilterAction.suspiciousDarkAreaHighlight,
+                label: 'Destacar areas escuras',
+                enabled: _filters.suspiciousDarkAreaHighlight,
+              ),
+            ],
+          ),
+        ],
+      ),
+      body: _buildBody(controller),
+    );
+  }
+
+  PopupMenuEntry<_FilterAction> _filterItem({
+    required _FilterAction action,
+    required String label,
+    required bool enabled,
+  }) {
+    return CheckedPopupMenuItem<_FilterAction>(
+      value: action,
+      checked: enabled,
+      child: Text(label),
+    );
+  }
+
+  Widget _buildBody(CameraController? controller) {
+    final errorMessage = _errorMessage;
+    if (errorMessage != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.no_photography_outlined, size: 48),
+              const SizedBox(height: 16),
+              Text(
+                errorMessage,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              if (_cameraErrorDetail != null) ...[
+                const SizedBox(height: 12),
+                SelectableText(
+                  _cameraErrorDetail!,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                ),
+              ],
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: () => unawaited(_setupCamera()),
+                icon: const Icon(Icons.refresh),
+                label: const Text('Tentar novamente'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_isInitializing ||
+        controller == null ||
+        !controller.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        if (_processedImage != null)
+          Image.memory(
+            _processedImage!,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+          )
+        else
+          CameraPreview(controller),
+        Positioned(
+          left: 12,
+          right: 12,
+          bottom: 86,
+          child: Center(
+            child: FilledButton.icon(
+              onPressed:
+                  _isCapturing ? null : () => unawaited(_captureCurrentFrame()),
+              icon: _isCapturing
+                  ? const SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.analytics_outlined),
+              label: Text(_isCapturing ? 'Analisando...' : 'Capturar analise'),
+            ),
+          ),
+        ),
+        Positioned(
+          left: 12,
+          right: 12,
+          bottom: 12,
+          child: _StatusBar(
+            camera: _selectedCamera,
+            resolution: _selectedResolution,
+            aiStatus: _aiStatus,
+            isRunningInference: _isRunningInference,
+            tfliteResult: _tfliteResult,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StatusBar extends StatelessWidget {
+  const _StatusBar({
+    required this.camera,
+    required this.resolution,
+    required this.aiStatus,
+    required this.isRunningInference,
+    required this.tfliteResult,
+  });
+
+  final CameraDescription? camera;
+  final ResolutionPreset resolution;
+  final String aiStatus;
+  final bool isRunningInference;
+  final TfliteDetectionResult? tfliteResult;
+
+  @override
+  Widget build(BuildContext context) {
+    final cameraLabel = switch (camera?.lensDirection) {
+      CameraLensDirection.back => 'traseira',
+      CameraLensDirection.front => 'frontal',
+      CameraLensDirection.external => 'externa',
+      null => 'camera',
+    };
+    final aiLabel = tfliteResult?.compactLabel ?? aiStatus;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.64),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Text(
+          'RGB $cameraLabel ${resolution.name} | '
+          '${isRunningInference ? 'IA analisando...' : aiLabel}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: Colors.white),
+        ),
+      ),
+    );
+  }
+}
