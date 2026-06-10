@@ -362,7 +362,7 @@ class TfliteDetectionResult {
     final activePercent = (activeRatio * 100).toStringAsFixed(1);
     final maxPercent = (maxScore * 100).toStringAsFixed(0);
     final inferenceMs = (inferenceMicros / 1000).toStringAsFixed(1);
-    return 'IA bordas $activePercent% | pico $maxPercent% | ${inferenceMs}ms';
+    return 'IA ativa $activePercent% | pico $maxPercent% | ${inferenceMs}ms';
   }
 
   static double _normalizeScore(double score) {

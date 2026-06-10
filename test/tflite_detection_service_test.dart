@@ -11,8 +11,12 @@ void main() {
 
   test('asset tflite esta declarado no bundle', () async {
     final modelBytes = await rootBundle.load('assets/edge_detection.tflite');
+    final magic = String.fromCharCodes(
+      modelBytes.buffer.asUint8List(4, 4),
+    );
 
     expect(modelBytes.lengthInBytes, greaterThan(0));
+    expect(magic, 'TFL3');
   });
 
   test('prepara input float32 RGB normalizado', () {

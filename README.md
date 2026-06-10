@@ -10,7 +10,7 @@ termico simulado e areas escuras suspeitas.
 - Processa frames YUV420 em uma etapa isolada da UI.
 - Analisa a imagem original antes de aplicar filtros visuais.
 - Carrega `assets/edge_detection.tflite` e roda inferencia periodica sobre o
-  frame original para resumir a intensidade de bordas detectadas.
+  frame original para resumir a atividade visual detectada pelo modelo.
 - Permite capturar o frame atual para uma tela de resultado com imagem,
   metricas visuais, status da IA e erro tecnico detalhado quando o modelo nao
   carrega ou nao executa.
@@ -40,12 +40,12 @@ flutter analyze
 flutter test
 ```
 
-## APK pelo GitHub Actions
+## Instalar no Android conectado por USB
 
-O workflow `Android Debug APK` gera um APK debug automaticamente em pushes e
-pull requests. Para baixar pelo celular:
+```bash
+flutter build apk --debug --no-pub
+adb install -r build/app/outputs/flutter-apk/app-debug.apk
+```
 
-1. Abra a aba **Actions** do repositorio no GitHub.
-2. Entre na execucao mais recente de **Android Debug APK**.
-3. Baixe o artifact `vistoria-visual-debug-apk`.
-4. Extraia o ZIP e instale o `app-debug.apk` no Android.
+O build por GitHub Actions foi removido; os APKs de teste agora sao gerados
+localmente e instalados direto no aparelho.
