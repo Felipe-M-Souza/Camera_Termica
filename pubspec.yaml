@@ -1,5 +1,5 @@
 name: vazamento_detector
-description: Aplicativo de detecção de vazamentos em piscinas usando câmera e IA.
+description: Aplicativo de vistoria visual usando camera e analise assistida.
 publish_to: 'none'
 
 version: 1.0.0+1
@@ -13,7 +13,7 @@ dependencies:
   camera: ^0.10.5+9
   path_provider: ^2.1.2
   image: ^4.5.4
-  tflite_flutter: ^0.10.4
+  tflite_flutter: ^0.12.1
   async: ^2.11.0
   permission_handler: ^11.0.1
   fluttertoast: ^8.2.4

@@ -1,16 +1,48 @@
-# thermal_camera
+# Vistoria Visual
 
-A new Flutter project.
+Aplicativo Flutter para analise visual assistida por camera. A versao atual usa
+imagem RGB do celular para realcar bordas, contraste, baixa luz simulada, mapa
+termico simulado e areas escuras suspeitas.
 
-## Getting Started
+## Escopo atual
 
-This project is a starting point for a Flutter application.
+- Captura stream da camera com o plugin `camera`.
+- Processa frames YUV420 em uma etapa isolada da UI.
+- Analisa a imagem original antes de aplicar filtros visuais.
+- Carrega `assets/edge_detection.tflite` e roda inferencia periodica sobre o
+  frame original para resumir a intensidade de bordas detectadas.
+- Mostra filtros simulados apenas como visualizacao, sem afirmar leitura termica
+  real.
 
-A few resources to get you started if this is your first Flutter project:
+## Limitacao importante
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+Celulares comuns nao capturam temperatura por pixel sem um sensor termico
+dedicado. Para termografia real, o app precisara integrar hardware externo
+como FLIR, Seek Thermal ou outro sensor compativel.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Proximos passos sugeridos
+
+- Treinar/substituir o modelo TFLite por um classificador real de manchas,
+  rachaduras ou sinais de vazamento.
+- Criar fluxo de vistoria com captura de fotos, anotacoes e relatorio.
+- Adicionar controles avancados de camera via Android nativo/Camera2 quando o
+  objetivo for explorar aparelhos como a linha Galaxy Ultra.
+- Configurar assinatura release e identificador de pacote definitivo.
+
+## Desenvolvimento
+
+```bash
+flutter pub get
+flutter analyze
+flutter test
+```
+
+## APK pelo GitHub Actions
+
+O workflow `Android Debug APK` gera um APK debug automaticamente em pushes e
+pull requests. Para baixar pelo celular:
+
+1. Abra a aba **Actions** do repositorio no GitHub.
+2. Entre na execucao mais recente de **Android Debug APK**.
+3. Baixe o artifact `vistoria-visual-debug-apk`.
+4. Extraia o ZIP e instale o `app-debug.apk` no Android.
