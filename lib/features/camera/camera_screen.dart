@@ -48,6 +48,7 @@ class _CameraScreenState extends State<CameraScreen>
   String _aiStatus = 'Carregando IA...';
   String? _aiErrorDetail;
   String? _errorMessage;
+  String? _cameraErrorDetail;
   var _isInitializing = true;
   var _isProcessing = false;
   var _isRunningInference = false;
@@ -103,6 +104,7 @@ class _CameraScreenState extends State<CameraScreen>
       setState(() {
         _isInitializing = true;
         _errorMessage = null;
+        _cameraErrorDetail = null;
       });
     }
 
@@ -115,6 +117,7 @@ class _CameraScreenState extends State<CameraScreen>
         setState(() {
           _isInitializing = false;
           _errorMessage = 'Permissao de camera negada.';
+          _cameraErrorDetail = 'Status da permissao: $permission';
         });
         return;
       }
@@ -127,6 +130,7 @@ class _CameraScreenState extends State<CameraScreen>
         setState(() {
           _isInitializing = false;
           _errorMessage = 'Nenhuma camera foi encontrada neste dispositivo.';
+          _cameraErrorDetail = 'availableCameras retornou lista vazia.';
         });
         return;
       }
@@ -151,6 +155,11 @@ class _CameraScreenState extends State<CameraScreen>
       setState(() {
         _isInitializing = false;
         _errorMessage = 'Nao foi possivel iniciar a camera.';
+        _cameraErrorDetail = _formatCameraError(
+          stage: 'Preparacao da camera',
+          error: error,
+          stackTrace: stackTrace,
+        );
       });
     }
   }
@@ -168,48 +177,92 @@ class _CameraScreenState extends State<CameraScreen>
       _isInitializing = true;
       _processedImage = null;
       _errorMessage = null;
+      _cameraErrorDetail = null;
     });
 
     await _disposeController();
 
-    final controller = CameraController(
-      camera,
-      _selectedResolution,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
+    Object? lastError;
+    StackTrace? lastStackTrace;
 
-    _cameraController = controller;
+    for (final resolution in _resolutionFallbacks(_selectedResolution)) {
+      final controller = CameraController(
+        camera,
+        resolution,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
 
-    try {
-      await controller.initialize();
-      if (!mounted || generation != _cameraGeneration) {
-        await controller.dispose();
+      _cameraController = controller;
+
+      try {
+        await controller.initialize();
+        if (!mounted || generation != _cameraGeneration) {
+          await controller.dispose();
+          return;
+        }
+
+        await controller.startImageStream(_onCameraImage);
+        if (!mounted || generation != _cameraGeneration) {
+          await controller.dispose();
+          return;
+        }
+
+        setState(() {
+          _isInitializing = false;
+          _selectedCamera = camera;
+          _selectedResolution = resolution;
+          _cameraErrorDetail = null;
+        });
         return;
+      } catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        debugPrint('Erro ao inicializar camera em ${resolution.name}: $error');
+        debugPrintStack(stackTrace: stackTrace);
+        if (_cameraController == controller) {
+          _cameraController = null;
+        }
+        try {
+          await controller.dispose();
+        } catch (disposeError) {
+          debugPrint('Erro ao descartar controller com falha: $disposeError');
+        }
+        if (!mounted || generation != _cameraGeneration) {
+          return;
+        }
       }
-
-      await controller.startImageStream(_onCameraImage);
-      if (!mounted || generation != _cameraGeneration) {
-        await controller.dispose();
-        return;
-      }
-
-      setState(() {
-        _isInitializing = false;
-        _selectedCamera = camera;
-      });
-    } catch (error, stackTrace) {
-      debugPrint('Erro ao inicializar camera: $error');
-      debugPrintStack(stackTrace: stackTrace);
-      await controller.dispose();
-      if (!mounted || generation != _cameraGeneration) {
-        return;
-      }
-      setState(() {
-        _isInitializing = false;
-        _errorMessage = 'Falha ao abrir a camera selecionada.';
-      });
     }
+
+    if (!mounted || generation != _cameraGeneration) {
+      return;
+    }
+
+    setState(() {
+      _isInitializing = false;
+      _errorMessage = 'Falha ao abrir a camera selecionada.';
+      _cameraErrorDetail = _formatCameraError(
+        stage: 'Abertura da camera',
+        error: lastError ?? 'Erro desconhecido',
+        stackTrace: lastStackTrace,
+      );
+    });
+  }
+
+  List<ResolutionPreset> _resolutionFallbacks(ResolutionPreset preferred) {
+    const fallbackOrder = [
+      ResolutionPreset.medium,
+      ResolutionPreset.low,
+      ResolutionPreset.high,
+      ResolutionPreset.veryHigh,
+      ResolutionPreset.ultraHigh,
+      ResolutionPreset.max,
+    ];
+
+    return [
+      preferred,
+      ...fallbackOrder.where((resolution) => resolution != preferred),
+    ];
   }
 
   void _onCameraImage(CameraImage image) {
@@ -386,6 +439,29 @@ class _CameraScreenState extends State<CameraScreen>
       return error.toString();
     }
     return '$error\n$stackLine';
+  }
+
+  String _formatCameraError({
+    required String stage,
+    required Object error,
+    StackTrace? stackTrace,
+  }) {
+    final buffer = StringBuffer()
+      ..writeln(stage)
+      ..writeln(error);
+
+    if (error is CameraException) {
+      buffer
+        ..writeln('code: ${error.code}')
+        ..writeln('description: ${error.description}');
+    }
+
+    final stackLines = stackTrace?.toString().split('\n') ?? const <String>[];
+    if (stackLines.isNotEmpty && stackLines.first.isNotEmpty) {
+      buffer.writeln(stackLines.first);
+    }
+
+    return buffer.toString().trim();
   }
 
   void _showAnalysisToast(ImageAnalysisResult analysis) {
@@ -615,6 +691,16 @@ class _CameraScreenState extends State<CameraScreen>
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.titleMedium,
               ),
+              if (_cameraErrorDetail != null) ...[
+                const SizedBox(height: 12),
+                SelectableText(
+                  _cameraErrorDetail!,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                ),
+              ],
               const SizedBox(height: 16),
               FilledButton.icon(
                 onPressed: () => unawaited(_setupCamera()),
