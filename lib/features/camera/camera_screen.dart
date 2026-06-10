@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:vazamento_detector/features/detection/tflite_detection_service.dart';
+import 'package:vazamento_detector/features/inspection/inspection_result.dart';
+import 'package:vazamento_detector/features/inspection/inspection_result_screen.dart';
 import 'package:vazamento_detector/features/processing/image_processor.dart';
 
 enum _FilterAction {
@@ -36,16 +38,20 @@ class _CameraScreenState extends State<CameraScreen>
   List<CameraDescription> _cameras = const [];
   CameraDescription? _selectedCamera;
   Uint8List? _processedImage;
+  Uint8List? _latestOriginalJpegBytes;
+  ImageAnalysisResult? _latestVisualAnalysis;
   TfliteDetectionResult? _tfliteResult;
   FilterOptions _filters = const FilterOptions();
   ResolutionPreset _selectedResolution = ResolutionPreset.medium;
   DateTime _lastProcessTime = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastInferenceTime = DateTime.fromMillisecondsSinceEpoch(0);
   String _aiStatus = 'Carregando IA...';
+  String? _aiErrorDetail;
   String? _errorMessage;
   var _isInitializing = true;
   var _isProcessing = false;
   var _isRunningInference = false;
+  var _isCapturing = false;
   var _alreadyShownToast = false;
   var _cameraGeneration = 0;
 
@@ -74,6 +80,7 @@ class _CameraScreenState extends State<CameraScreen>
       }
       setState(() {
         _aiStatus = 'IA indisponivel';
+        _aiErrorDetail = _formatAiError(error, stackTrace);
       });
     }
   }
@@ -232,6 +239,8 @@ class _CameraScreenState extends State<CameraScreen>
       _showAnalysisToast(result.analysis);
       setState(() {
         _processedImage = result.jpegBytes;
+        _latestOriginalJpegBytes = result.originalJpegBytes;
+        _latestVisualAnalysis = result.analysis;
       });
       unawaited(_maybeRunTflite(result.originalJpegBytes));
     } catch (error, stackTrace) {
@@ -262,6 +271,7 @@ class _CameraScreenState extends State<CameraScreen>
       setState(() {
         _tfliteResult = result;
         _aiStatus = result.compactLabel;
+        _aiErrorDetail = null;
       });
     } catch (error, stackTrace) {
       debugPrint('Erro na inferencia TFLite: $error');
@@ -271,6 +281,7 @@ class _CameraScreenState extends State<CameraScreen>
       }
       setState(() {
         _aiStatus = 'Erro na IA';
+        _aiErrorDetail = _formatAiError(error, stackTrace);
       });
     } finally {
       if (mounted) {
@@ -281,6 +292,100 @@ class _CameraScreenState extends State<CameraScreen>
         _isRunningInference = false;
       }
     }
+  }
+
+  Future<void> _captureCurrentFrame() async {
+    final imageBytes = _latestOriginalJpegBytes;
+    final visualAnalysis = _latestVisualAnalysis;
+    if (imageBytes == null || visualAnalysis == null) {
+      Fluttertoast.showToast(
+        msg: 'Aguarde o primeiro frame da camera.',
+        toastLength: Toast.LENGTH_SHORT,
+        gravity: ToastGravity.TOP,
+      );
+      return;
+    }
+
+    setState(() {
+      _isCapturing = true;
+    });
+
+    var aiStatus = _aiStatus;
+    var aiErrorDetail = _aiErrorDetail;
+    var aiResult = _tfliteResult;
+
+    if (_detectionService.isLoaded && !_isRunningInference) {
+      try {
+        final result = _detectionService.run(imageBytes);
+        if (result != null) {
+          aiResult = result;
+          aiStatus = result.compactLabel;
+          aiErrorDetail = null;
+        }
+      } catch (error, stackTrace) {
+        debugPrint('Erro na inferencia capturada: $error');
+        debugPrintStack(stackTrace: stackTrace);
+        aiStatus = 'Erro na IA';
+        aiErrorDetail = _formatAiError(error, stackTrace);
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _isCapturing = false;
+      _tfliteResult = aiResult;
+      _aiStatus = aiStatus;
+      _aiErrorDetail = aiErrorDetail;
+    });
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => InspectionResultScreen(
+          result: InspectionResult(
+            imageBytes: imageBytes,
+            visualAnalysis: visualAnalysis,
+            aiResult: aiResult,
+            aiStatus: aiStatus,
+            aiErrorDetail: aiErrorDetail,
+            createdAt: DateTime.now(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showAiDetails() {
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Detalhes da IA'),
+          content: SelectableText(
+            _aiErrorDetail ??
+                _detectionService.modelSummary ??
+                'Modelo ainda nao carregado.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Fechar'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _formatAiError(Object error, StackTrace stackTrace) {
+    final stackLines = stackTrace.toString().split('\n');
+    final stackLine = stackLines.isEmpty ? null : stackLines.first;
+    if (stackLine == null || stackLine.isEmpty) {
+      return error.toString();
+    }
+    return '$error\n$stackLine';
   }
 
   void _showAnalysisToast(ImageAnalysisResult analysis) {
@@ -407,6 +512,15 @@ class _CameraScreenState extends State<CameraScreen>
             icon: const Icon(Icons.brightness_6),
             onPressed: widget.onThemeToggle,
           ),
+          IconButton(
+            tooltip: 'Detalhes da IA',
+            icon: Icon(
+              _aiErrorDetail == null
+                  ? Icons.psychology_outlined
+                  : Icons.error_outline,
+            ),
+            onPressed: _showAiDetails,
+          ),
           if (_cameras.length > 1)
             IconButton(
               tooltip: 'Alternar camera',
@@ -530,6 +644,24 @@ class _CameraScreenState extends State<CameraScreen>
           )
         else
           CameraPreview(controller),
+        Positioned(
+          left: 12,
+          right: 12,
+          bottom: 86,
+          child: Center(
+            child: FilledButton.icon(
+              onPressed:
+                  _isCapturing ? null : () => unawaited(_captureCurrentFrame()),
+              icon: _isCapturing
+                  ? const SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.analytics_outlined),
+              label: Text(_isCapturing ? 'Analisando...' : 'Capturar analise'),
+            ),
+          ),
+        ),
         Positioned(
           left: 12,
           right: 12,

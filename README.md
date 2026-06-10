@@ -11,6 +11,9 @@ termico simulado e areas escuras suspeitas.
 - Analisa a imagem original antes de aplicar filtros visuais.
 - Carrega `assets/edge_detection.tflite` e roda inferencia periodica sobre o
   frame original para resumir a intensidade de bordas detectadas.
+- Permite capturar o frame atual para uma tela de resultado com imagem,
+  metricas visuais, status da IA e erro tecnico detalhado quando o modelo nao
+  carrega ou nao executa.
 - Mostra filtros simulados apenas como visualizacao, sem afirmar leitura termica
   real.
 
